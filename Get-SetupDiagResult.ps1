@@ -1,7 +1,36 @@
 <#
-This script will gather the information that SetupDiag puts in the registry and write that to a log file.
-You must change the $centralLogFile variable to a shared folder on the network
+This script will gather the information that SetupDiag puts in the registry and write that to a log file and/or a Database (not tested yet).
+
+Create DB table "CompatScanFailures" in DB "W10WAAS":
+
+USE W10WAAS;
+CREATE TABLE CompatScanFailures (
+    Computername varchar(255),
+    ErrorCode varchar(255),
+    KnownErrorMSG varchar(255),
+    FailureData varchar(255),
+    FailureDetails varchar(255),
+    ProfileName varchar(255),
+    Remediation varchar(255),
+    RunTime varchar(255),
+    FailureCount varchar(255)
+);
+
 #>
+
+# Database logging or not, $true or $false (NOT IMPLEMENTED YET)
+$databaseLogging = $false
+
+# Database server, database and table
+$databaseServer = "SQL.contoso.com"
+$databaseDB = "W10WAAS"
+$databaseTable = "CompatScanFailures"
+
+# Central file based logging or not, $true or $false
+$centralLogging = $true
+
+# Set the location of central logfile (only relevant if $centralLogging = $true)
+$centralLogFile = "\\server\Win10UpgradeLogs$\SetupDiag\$env:COMPUTERNAME" + ".log"
 
 # Get returncode from CompatScan and convert to hex value
 $CompatScanResultHex = "{0:x8}" -f (Get-ItemPropertyValue -Path HKLM:\SYSTEM\Setup\MoSetup\Volatile -Name BoxResult -ErrorAction SilentlyContinue)
@@ -17,23 +46,17 @@ else
     # Set the location of the local logfile. Comment out if you don't want a local log file
     $localLogFile = "$env:SystemRoot\Temp\Get-SetupDiagResult.log"
 
-    # Set the location of central logfile
-    $centralLogFile = "\\server\Win10UpgradeLogs$\SetupDiag\$env:COMPUTERNAME" + ".log"
-
-    # Database logging or not (NOT IMPLEMENTED YET)
-    $databaseLog = $false
-
     # Hex to message translation for known error codes
     # https://support.microsoft.com/en-us/help/10587/windows-10-get-help-with-upgrade-installation-errors
     switch ($CompatScanResultHex) {
         "c1900223" {$CompatScanKnownError = "Unable to get update"}
-        "c1900208" {$CompatScanKnownError = "Incompatible application"}
+        "c1900208" {$CompatScanKnownError = "Incompatible application (McAfee? - DOH!)"}
         "80073712" {$CompatScanKnownError = "Missing or corrupt file"}
         "c1900200" {$CompatScanKnownError = "Minimum requirement not met"}
         "c1900202" {$CompatScanKnownError = "Minimum requirement not met"}
         "800F0923" {$CompatScanKnownError = "Incompatible driver"}
         "80070070" {$CompatScanKnownError = "Not enough disk space"}
-        "c1900101" {$CompatScanKnownError = "Incompatible driver or Anti Virus"}
+        "c1900101" {$CompatScanKnownError = "Incompatible driver or Anti Virus (McAfee? - DOH!)"}
         "800700B7" {$CompatScanKnownError = "Another process is blocking the upgrade"}
         "c1900107" {$CompatScanKnownError = "Cleanup from previous attempt is pending. Restart Required."}
         Default {$CompatScanKnownError = "Unknown error"}
@@ -60,9 +83,40 @@ else
     $logContent | Add-Member -MemberType NoteProperty -Name CompatScanKnownError -Value $failureCount
 
     # Output the information to the log files specified
-    $logContent | ConvertTo-Csv | Out-File $centralLogFile
+    if ($centralLogging)
+    {
+        $logContent | ConvertTo-Csv | Out-File $centralLogFile
+    }
+
     if ($localLogFile)
     {
         $logContent | ConvertTo-Html | Out-File $localLogFile
+    }
+
+    if ($databaseLogging)
+    {
+        $sqlConnection = New-Object System.Data.SqlClient.SqlConnection
+        $sqlConnection.ConnectionString = "Server=$databaseServer;Database=$databaseDB;Integrated Security=True;"
+        $sqlConnection.Open()
+    
+        $query= "begin tran
+                if exists (SELECT * FROM $databaseTable WITH (updlock,serializable) WHERE Computername='"+$env:COMPUTERNAME+"')
+                begin
+                    UPDATE $databaseTable SET Computername='"+$env:COMPUTERNAME+"', ErrorCode='"+$CompatScanResultHex+"', KnownErrorMSG='"+$CompatScanKnownError+"', FailureData='"+$failureData+"', FailureDetails='"+$failureDetails+"', ProfileName='"+$profileName+"', Remediation='"+$remediation+"', RunTime='"+$runTime+"', FailureCount='"+$failureCount+"'
+                    WHERE Computername = '"+$env:COMPUTERNAME+"'
+                end
+                else
+                begin
+                    INSERT INTO $databaseTable (Computername, ErrorCode, KnownErrorMSG, FailureData, FailureDetails, ProfileName, Remediation, RunTime, FailureCount)
+                    VALUES ('"+$env:COMPUTERNAME+"', '"+$CompatScanResultHex+"', '"+$CompatScanKnownError+"', '"+$failureData+"', '"+$failureDetails+"', '"+$profileName+"', '"+$remediation+"', '"+$runTime+"', '"+$failureCount+"')
+                end
+                commit tran"
+    
+        $sqlCommand = New-Object System.Data.SqlClient.SqlCommand($query,$sqlConnection)
+        $sqlDS = New-Object System.Data.DataSet
+        $sqlDA = New-Object System.Data.SqlClient.SqlDataAdapter($sqlCommand)
+        [void]$sqlDA.Fill($sqlDS)
+    
+        $sqlConnection.Close()
     }
 }
